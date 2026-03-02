@@ -1,0 +1,234 @@
+"""Service for replay job management."""
+
+from typing import Optional, List
+from uuid import UUID
+from datetime import datetime
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import ReplayJob, ReplayJobStatus
+from app.models import (
+    CreateReplayJobRequest,
+    UpdateReplayJobRequest,
+    ReplayJobResponse,
+    ReplayJobProgressResponse,
+    ReplayJobStatisticsResponse,
+)
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class ReplayService:
+    """Service for managing replay jobs."""
+
+    def __init__(self, session: AsyncSession):
+        """Initialize replay service."""
+        self.session = session
+
+    async def create_job(self, request: CreateReplayJobRequest) -> ReplayJobResponse:
+        """Create a new replay job."""
+        try:
+            job = ReplayJob(
+                name=request.name,
+                description=request.description,
+                source_topic=request.source_topic,
+                target_topic=request.target_topic,
+                enrichment_script=request.enrichment_script,
+                batch_size=request.batch_size,
+                dry_run=request.dry_run,
+                created_by=request.created_by,
+                status=ReplayJobStatus.PENDING,
+            )
+
+            # Set filter fields if provided
+            if request.filters:
+                job.start_offset = request.filters.start_offset
+                job.end_offset = request.filters.end_offset
+                job.start_timestamp = request.filters.start_timestamp
+                job.end_timestamp = request.filters.end_timestamp
+                job.key_pattern = request.filters.key_pattern
+                job.payload_filter = request.filters.payload_filter
+
+            self.session.add(job)
+            await self.session.flush()
+            await self.session.refresh(job)
+
+            logger.info("Created replay job", job_id=job.job_id, source_topic=job.source_topic)
+
+            return self._to_response(job)
+
+        except Exception as e:
+            logger.error("Failed to create replay job", error=str(e))
+            raise
+
+    async def get_job(self, job_id: UUID) -> Optional[ReplayJobResponse]:
+        """Get a replay job by ID."""
+        try:
+            stmt = select(ReplayJob).where(ReplayJob.job_id == job_id)
+            result = await self.session.execute(stmt)
+            job = result.scalar_one_or_none()
+
+            if job:
+                return self._to_response(job)
+
+            logger.warning("Job not found", job_id=job_id)
+            return None
+
+        except Exception as e:
+            logger.error("Failed to get replay job", job_id=job_id, error=str(e))
+            raise
+
+    async def list_jobs(self, skip: int = 0, limit: int = 10) -> tuple[List[ReplayJobResponse], int]:
+        """List replay jobs with pagination."""
+        try:
+            # Get total count
+            count_stmt = select(ReplayJob)
+            count_result = await self.session.execute(count_stmt)
+            total = len(count_result.all())
+
+            # Get paginated results
+            stmt = select(ReplayJob).offset(skip).limit(limit).order_by(ReplayJob.created_at.desc())
+            result = await self.session.execute(stmt)
+            jobs = result.scalars().all()
+
+            logger.info("Listed replay jobs", skip=skip, limit=limit, total=total)
+
+            return [self._to_response(job) for job in jobs], total
+
+        except Exception as e:
+            logger.error("Failed to list replay jobs", error=str(e))
+            raise
+
+    async def update_job(self, job_id: UUID, request: UpdateReplayJobRequest) -> Optional[ReplayJobResponse]:
+        """Update a replay job."""
+        try:
+            stmt = select(ReplayJob).where(ReplayJob.job_id == job_id)
+            result = await self.session.execute(stmt)
+            job = result.scalar_one_or_none()
+
+            if not job:
+                logger.warning("Job not found for update", job_id=job_id)
+                return None
+
+            # Only allow updates if job is not running
+            if job.status == ReplayJobStatus.RUNNING:
+                raise ValueError("Cannot update a running job")
+
+            # Update fields
+            if request.name is not None:
+                job.name = request.name
+            if request.description is not None:
+                job.description = request.description
+            if request.enrichment_script is not None:
+                job.enrichment_script = request.enrichment_script
+            if request.last_modified_by is not None:
+                job.last_modified_by = request.last_modified_by
+
+            job.updated_at = datetime.utcnow()
+            await self.session.flush()
+            await self.session.refresh(job)
+
+            logger.info("Updated replay job", job_id=job_id)
+
+            return self._to_response(job)
+
+        except Exception as e:
+            logger.error("Failed to update replay job", job_id=job_id, error=str(e))
+            raise
+
+    async def update_job_status(
+        self,
+        job_id: UUID,
+        status: ReplayJobStatus,
+        **kwargs,
+    ) -> Optional[ReplayJobResponse]:
+        """Update job status and optional fields."""
+        try:
+            stmt = select(ReplayJob).where(ReplayJob.job_id == job_id)
+            result = await self.session.execute(stmt)
+            job = result.scalar_one_or_none()
+
+            if not job:
+                return None
+
+            job.status = status
+            job.updated_at = datetime.utcnow()
+
+            # Update optional fields
+            for key, value in kwargs.items():
+                if hasattr(job, key):
+                    setattr(job, key, value)
+
+            await self.session.flush()
+            await self.session.refresh(job)
+
+            logger.info("Updated job status", job_id=job_id, status=status)
+
+            return self._to_response(job)
+
+        except Exception as e:
+            logger.error("Failed to update job status", job_id=job_id, error=str(e))
+            raise
+
+    async def delete_job(self, job_id: UUID) -> bool:
+        """Delete a replay job."""
+        try:
+            stmt = select(ReplayJob).where(ReplayJob.job_id == job_id)
+            result = await self.session.execute(stmt)
+            job = result.scalar_one_or_none()
+
+            if not job:
+                logger.warning("Job not found for deletion", job_id=job_id)
+                return False
+
+            if job.status == ReplayJobStatus.RUNNING:
+                raise ValueError("Cannot delete a running job")
+
+            await self.session.delete(job)
+            await self.session.flush()
+
+            logger.info("Deleted replay job", job_id=job_id)
+
+            return True
+
+        except Exception as e:
+            logger.error("Failed to delete replay job", job_id=job_id, error=str(e))
+            raise
+
+    @staticmethod
+    def _to_response(job: ReplayJob) -> ReplayJobResponse:
+        """Convert database model to response model."""
+        # Calculate progress percentage
+        percentage = 0.0
+        if job.total_messages > 0:
+            percentage = (job.processed_messages / job.total_messages) * 100
+
+        return ReplayJobResponse(
+            job_id=job.job_id,
+            name=job.name,
+            description=job.description,
+            source_topic=job.source_topic,
+            target_topic=job.target_topic,
+            status=job.status,
+            progress=ReplayJobProgressResponse(
+                total_messages=job.total_messages,
+                processed_messages=job.processed_messages,
+                failed_messages=job.failed_messages,
+                skipped_messages=job.skipped_messages,
+                percentage=percentage,
+            ),
+            statistics=ReplayJobStatisticsResponse(
+                start_time=job.start_time,
+                end_time=job.end_time,
+                duration_seconds=job.duration_seconds,
+                throughput_msgs_per_sec=job.throughput_msgs_per_sec,
+            ),
+            enrichment_script=job.enrichment_script,
+            batch_size=job.batch_size,
+            dry_run=job.dry_run,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+            created_by=job.created_by,
+            last_modified_by=job.last_modified_by,
+        )

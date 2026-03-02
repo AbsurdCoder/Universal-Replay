@@ -1,0 +1,87 @@
+"""Service for message encoding/decoding."""
+
+import json
+from typing import Any, Dict, Optional
+
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class EncodingService:
+    """Service for encoding and decoding messages."""
+
+    @staticmethod
+    def decode_message(value: bytes, encoding: str = "utf-8") -> Any:
+        """
+        Decode a message value.
+
+        Tries to decode as JSON first, then falls back to string.
+        """
+        if not value:
+            return None
+
+        try:
+            # Try to decode as UTF-8 string
+            text = value.decode(encoding)
+
+            # Try to parse as JSON
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                # Return as plain string if not JSON
+                return text
+
+        except UnicodeDecodeError:
+            logger.warning("Failed to decode message as UTF-8, returning as bytes")
+            return value
+
+    @staticmethod
+    def encode_message(value: Any, encoding: str = "utf-8") -> bytes:
+        """
+        Encode a message value.
+
+        Converts to JSON if dict/list, otherwise to string.
+        """
+        if isinstance(value, bytes):
+            return value
+
+        if isinstance(value, (dict, list)):
+            return json.dumps(value).encode(encoding)
+
+        if isinstance(value, str):
+            return value.encode(encoding)
+
+        # Convert other types to string then encode
+        return str(value).encode(encoding)
+
+    @staticmethod
+    def decode_headers(headers: Optional[Dict[str, bytes]]) -> Dict[str, str]:
+        """Decode message headers from bytes to strings."""
+        if not headers:
+            return {}
+
+        decoded = {}
+        for key, value in headers.items():
+            try:
+                decoded[key] = value.decode("utf-8") if isinstance(value, bytes) else value
+            except UnicodeDecodeError:
+                logger.warning(f"Failed to decode header '{key}', skipping")
+                continue
+
+        return decoded
+
+    @staticmethod
+    def encode_headers(headers: Optional[Dict[str, str]]) -> Optional[Dict[str, bytes]]:
+        """Encode message headers from strings to bytes."""
+        if not headers:
+            return None
+
+        encoded = {}
+        for key, value in headers.items():
+            if isinstance(value, bytes):
+                encoded[key] = value
+            else:
+                encoded[key] = str(value).encode("utf-8")
+
+        return encoded

@@ -1,0 +1,225 @@
+"""Kafka adapter implementation using aiokafka."""
+
+from typing import AsyncGenerator, Dict, Any, Optional, List
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, AIOKafkaAdminClient
+from aiokafka.errors import KafkaError
+
+from app.adapters.base import MessagingAdapter, Message
+from app.core.config import settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class KafkaAdapter(MessagingAdapter):
+    """Kafka adapter using aiokafka for async operations."""
+
+    def __init__(self):
+        """Initialize Kafka adapter."""
+        self.bootstrap_servers = settings.KAFKA_BOOTSTRAP_SERVERS.split(",")
+        self.consumer: Optional[AIOKafkaConsumer] = None
+        self.producer: Optional[AIOKafkaProducer] = None
+        self.admin_client: Optional[AIOKafkaAdminClient] = None
+
+    async def connect(self) -> None:
+        """Connect to Kafka cluster."""
+        logger.info("Connecting to Kafka", bootstrap_servers=self.bootstrap_servers)
+
+        self.admin_client = AIOKafkaAdminClient(
+            bootstrap_servers=self.bootstrap_servers,
+        )
+        await self.admin_client.start()
+
+        self.producer = AIOKafkaProducer(
+            bootstrap_servers=self.bootstrap_servers,
+            compression_type="gzip",
+        )
+        await self.producer.start()
+
+        logger.info("Connected to Kafka successfully")
+
+    async def disconnect(self) -> None:
+        """Disconnect from Kafka cluster."""
+        logger.info("Disconnecting from Kafka")
+
+        if self.producer:
+            await self.producer.stop()
+
+        if self.admin_client:
+            await self.admin_client.close()
+
+        logger.info("Disconnected from Kafka")
+
+    async def list_topics(self) -> List[str]:
+        """List all available topics."""
+        if not self.admin_client:
+            raise RuntimeError("Not connected to Kafka")
+
+        try:
+            metadata = await self.admin_client.fetch_all_metadata()
+            return list(metadata.topics())
+        except KafkaError as e:
+            logger.error("Failed to list topics", error=str(e))
+            raise
+
+    async def get_topic_partitions(self, topic: str) -> int:
+        """Get the number of partitions for a topic."""
+        if not self.admin_client:
+            raise RuntimeError("Not connected to Kafka")
+
+        try:
+            metadata = await self.admin_client.fetch_all_metadata()
+            topic_metadata = metadata.topics().get(topic)
+            if not topic_metadata:
+                raise ValueError(f"Topic '{topic}' not found")
+            return len(topic_metadata.partitions())
+        except KafkaError as e:
+            logger.error("Failed to get topic partitions", topic=topic, error=str(e))
+            raise
+
+    async def consume_messages(
+        self,
+        topic: str,
+        start_offset: Optional[int] = None,
+        end_offset: Optional[int] = None,
+        partition: int = 0,
+    ) -> AsyncGenerator[Message, None]:
+        """
+        Consume messages from a topic with memory-efficient streaming.
+        
+        Uses async generator to yield messages one at a time, never loading
+        the entire topic into memory.
+        """
+        consumer = AIOKafkaConsumer(
+            topic,
+            bootstrap_servers=self.bootstrap_servers,
+            group_id=settings.KAFKA_CONSUMER_GROUP_ID,
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+            value_deserializer=lambda m: m,
+            key_deserializer=lambda m: m if m else None,
+        )
+
+        try:
+            await consumer.start()
+            logger.info(
+                "Started consuming messages",
+                topic=topic,
+                partition=partition,
+                start_offset=start_offset,
+            )
+
+            # Seek to start offset if specified
+            if start_offset is not None:
+                consumer.seek(partition, start_offset)
+
+            message_count = 0
+            async for message in consumer:
+                # Check end offset
+                if end_offset is not None and message.offset > end_offset:
+                    logger.info(
+                        "Reached end offset",
+                        topic=topic,
+                        offset=message.offset,
+                        end_offset=end_offset,
+                    )
+                    break
+
+                # Yield message
+                yield Message(
+                    key=message.key,
+                    value=message.value,
+                    offset=message.offset,
+                    partition=message.partition,
+                    timestamp=message.timestamp,
+                    headers=dict(message.headers) if message.headers else {},
+                )
+
+                message_count += 1
+                if message_count % 1000 == 0:
+                    logger.debug(
+                        "Consumed messages",
+                        topic=topic,
+                        count=message_count,
+                        offset=message.offset,
+                    )
+
+            logger.info(
+                "Finished consuming messages",
+                topic=topic,
+                total_messages=message_count,
+            )
+
+        except KafkaError as e:
+            logger.error("Error consuming messages", topic=topic, error=str(e))
+            raise
+        finally:
+            await consumer.stop()
+
+    async def produce_message(
+        self,
+        topic: str,
+        key: Optional[bytes],
+        value: bytes,
+        headers: Optional[Dict[str, bytes]] = None,
+    ) -> None:
+        """Produce a message to a topic."""
+        if not self.producer:
+            raise RuntimeError("Not connected to Kafka")
+
+        try:
+            await self.producer.send_and_wait(
+                topic,
+                key=key,
+                value=value,
+                headers=list(headers.items()) if headers else None,
+            )
+        except KafkaError as e:
+            logger.error(
+                "Failed to produce message",
+                topic=topic,
+                error=str(e),
+            )
+            raise
+
+    async def get_topic_offset_range(self, topic: str, partition: int = 0) -> tuple[int, int]:
+        """Get the earliest and latest offsets for a topic partition."""
+        consumer = AIOKafkaConsumer(
+            bootstrap_servers=self.bootstrap_servers,
+            group_id=settings.KAFKA_CONSUMER_GROUP_ID,
+        )
+
+        try:
+            await consumer.start()
+
+            # Get earliest offset
+            consumer.assign([])
+            tp = (topic, partition)
+            consumer.assign([tp])
+            consumer.seek_to_beginning(tp)
+            earliest = consumer.position(tp)
+
+            # Get latest offset
+            consumer.seek_to_end(tp)
+            latest = consumer.position(tp)
+
+            logger.info(
+                "Got topic offset range",
+                topic=topic,
+                partition=partition,
+                earliest=earliest,
+                latest=latest,
+            )
+
+            return earliest, latest
+
+        except KafkaError as e:
+            logger.error(
+                "Failed to get offset range",
+                topic=topic,
+                partition=partition,
+                error=str(e),
+            )
+            raise
+        finally:
+            await consumer.stop()
